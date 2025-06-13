@@ -1,3 +1,29 @@
+/**
+ * @file rng_sts.cpp
+ * @brief Набор 32‑битных генераторов псевдослучайных чисел (ГПСЧ),
+ *        реализация пяти базовых статистических тестов NIST‑STS и
+ *        микробенчмарк скорости генерации.
+ *
+ * Программа демонстрирует:
+ *  - **Три компактных ГПСЧ** (\ref LcgPerm32, \ref Xsw32, \ref SaltedCb32)
+ *    и стандартный *std::mt19937* с унифицированным интерфейсом `next()`.
+ *  - **Пять простейших тестов из пакета NIST‑STS**: частоты (Monobit),
+ *    частоты по блокам, чередований (Runs), максимальной серии единиц
+ *    и сумм накопленных отклонений (Cusum).
+ *  - **Χ²‑тест равномерности** (10 корзин) по 32‑битным словам.
+ *  - **Измерение производительности** генераторов на возрастающих объёмах
+ *    данных с сохранением результатов в CSV‑файл `rng_speed.csv`.
+ *
+ * Каждый генератор исследуется на 20 выборках по 1000 значений.  Вывод
+ * программы содержит усечённые статистики (среднее, σ, коэффициент
+ * вариации) и p‑значения испытуемых тестов, помечая звёздочкой результаты,
+ * которые выходят за рекомендуемые границы.
+ *
+ * @author Alex Sakharov
+ * @date 2025‑06‑13
+ * @copyright MIT
+ */
+
 #include <cstdint>
 #include <iostream>
 #include <vector>
@@ -9,20 +35,48 @@
 #include <random>
 #include <fstream>
 
-using u32 = std::uint32_t;
-using u64 = std::uint64_t;
-using clk = std::chrono::high_resolution_clock;
+/** @name Согласованные типы */
+///@{
+using u32 = std::uint32_t; ///< 32‑битовое беззнаковое целое
+using u64 = std::uint64_t; ///< 64‑битовое беззнаковое целое
+using clk = std::chrono::high_resolution_clock; ///< Сокращение для доступного таймера
+///@}
 
-// ============================================================
-// 1. LcgPerm32  — mini‑PCG (LCG + xorshift + rotate) 32‑bit
-// ============================================================
+/**
+ * @class LcgPerm32
+ * @brief 32‑битный *permuted LCG*: линейный конгруэнтный шаг + лайтовая
+ *        «выжимка» (xorshift → rot).  Аналог **mini‑PCG**.
+ *
+ * Формула обновления:
+ * ```text
+ * state = state * A + C (mod 2^64)
+ * ```
+ * Затем берётся верхняя часть состояния, к ней применяется XOR‑сдвиг и
+ * циклическая ротация, что даёт хорошо перемешанное 32‑битное значение.
+ *
+ * @tparam A Множитель LCG (фиксированная константа PCG)
+ * @tparam C Прибавка LCG (фиксированная константа PCG)
+ * @see "Melissa O'Neill. PCG: A Family of Simple Fast Space‑Efficient
+ *       Statistically Good Random Number Generators".
+ */
 struct LcgPerm32 {
-    u64 state;
+    u64 state; ///< Текущее состояние 64‑битного LCG
     static constexpr u64 A = 6364136223846793005ULL;
     static constexpr u64 C = 1442695040888963407ULL;
 
+    /**
+     * @brief Конструктор
+     * @param seed Начальное состояние; при 0 формально допускается нулевой
+     *             конгруэнтный класс, но для PCG это безвредно.
+     */
     explicit LcgPerm32(u64 seed = 0) : state(seed) {}
 
+    /**
+     * @brief Сгенерировать очередное 32‑битное слово.
+     * @return Псевдослучайное значение \f$\in [0,2^{32})\f$.
+     * @warning Не переинициализируйте генератор слишком часто —
+     *          период полного цикла достигается только при нечётных С.
+     */
     u32 next() {
         state = state * A + C;                                   // шаг LCG
         u32 x = static_cast<u32>(((state >> 18) ^ state) >> 27); // xorshift‑выжимка
@@ -31,13 +85,27 @@ struct LcgPerm32 {
     }
 };
 
-// ============================================================
-// 2. Xsw32 — XORShift64 + Weyl, вывод верхних 32 бит
-// ============================================================
+/**
+ * @class Xsw32
+ * @brief 64‑битный XORShift с аддитивной Weyl‑последовательностью
+ *        и выводом старших 32 бит суммы — вариант конструкции
+ *        xorshift*+.
+ *
+ * Алгоритм предложен Sebastiano Vigna (xorshift64* / xorshift+) и
+ * дополнительно «посолён» Weyl‑инкрементом, что убирает линейность в
+ * \f$\mathbb{F}_2\f$.
+ */
 struct Xsw32 {
-    u64 x, w;
+    u64 x; ///< Внутреннее состояние XORShift
+    u64 w; ///< Weyl‑счётчик (аддитивный, нечётный)
+
+    /**
+     * @param seed Начальное состояние; 0 заменяется на 1, а Weyl ставится
+     *             в дополнение до ~seed, обеспечивая разные траектории.
+     */
     explicit Xsw32(u64 seed = 1) : x(seed ? seed : 1), w(~seed) {}
 
+    /// Генерирует псевдослучайное 32‑битное значение.
     u32 next() {
         x ^= x << 7;
         x ^= x >> 9;
@@ -47,17 +115,37 @@ struct Xsw32 {
     }
 };
 
-// ============================================================
-// 3. SaltedCb32 — SplitMix64 + двойная соль, средние 32 бит
-// ============================================================
+/**
+ * @class SaltedCb32
+ * @brief Счётчик‑based ГПСЧ в духе SplitMix64, но с «двойной солью»
+ *        (два независимых 64‑битных смещения), что усложняет
+ *        восстановление состояния по выходу.
+ *
+ * Функция `mix()` — это два раунда *SplitMix* (xorshift ⟶ mul ⟶ xorshift ⟶ mul),
+ * которые хорошо перемешивают вход `z`, прибавленный к одной соли и XOR‑енный
+ * с другой.
+ */
 struct SaltedCb32 {
-    u64 cnt, s1, s2;
+    u64 cnt; ///< Счётчик (увеличивается на 1 каждый вызов)
+    u64 s1;  ///< Соль №1 (сложение)
+    u64 s2;  ///< Соль №2 (XOR)
 
+    /**
+     * @param seed Произвольное 64‑битное значение; формирует обе соли и
+     *             начальный счётчик.
+     */
     explicit SaltedCb32(u64 seed = 0)
         : cnt(seed),
           s1(0x9e3779b97f4a7c15ULL ^ seed),
           s2(0x60642e2a34326f15ULL + (seed << 1)) {}
 
+    /**
+     * @brief Внутренняя смесь (*private static*).
+     * @param z Перемешиваемое значение (обычно счётчик)
+     * @param a Соль‑слагаемое
+     * @param b Соль‑XOR
+     * @return Полностью перемешанный 64‑битный результат
+     */
     static u64 mix(u64 z, u64 a, u64 b) {
         z += a;
         z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -66,22 +154,33 @@ struct SaltedCb32 {
         return z ^ (z >> 31);
     }
 
+    /**
+     * @brief Псевдослучайное слово из «средних» 32 бит результата `mix()`.
+     */
     u32 next() { return static_cast<u32>(mix(++cnt, s1, s2) >> 16); } // средние 32 бита
 };
 
-// ============================================================
-// 4. Mt32 - стандартный ГПСЧ std::mt19937 с методом next
-// ============================================================
+/**
+ * @class Mt32
+ * @brief Обёртка над стандартным *Mersenne Twister* (\c std::mt19937),
+ *        предоставляющая метод `next()` для унификации интерфейса.
+ */
 struct Mt32 {
-    std::mt19937 e;
+    std::mt19937 e; ///< Встроенный двигатель STL
+
+    /// @param seed Начальное значение для `std::mt19937::seed()`.
     explicit Mt32(u32 seed) { e.seed(seed); }
+
+    /// Возвращает очередное псевдослучайное 32‑битное число.
     u32 next() { return e(); }     // теперь интерфейс такой же, как у других ГПСЧ
 };
 
-// ============================================================
-//  Вспомогательные функции: gammaQ (верхняя регуляриз. гамма)
-// ============================================================
+/**
+ * Пространство имён с реализациями частичной суммы и непродолженной дроби
+ * для верхней регуляризованной гамма‑функции *Q(a,x)*.
+ */
 namespace impl {
+    /// Схема разложения в ряд (лучше при *x < a+1*).
     double gamma_series(double a, double x) {
         const int ITMAX = 1000; const double EPS = 1e-9;
         double sum = 1.0 / a, term = sum;
@@ -93,6 +192,7 @@ namespace impl {
         return sum * std::exp(-x + a * std::log(x));
     }
 
+    /// Вычисление дробью (лучше при *x ≥ a+1*).
     double gamma_cf(double a, double x) {
         const int ITMAX = 1000; const double EPS = 1e-9; const double FPMIN = 1e-30;
         double b = x + 1 - a, c = 1 / FPMIN, d = 1 / b, f = d;
@@ -107,6 +207,7 @@ namespace impl {
     }
 }
 
+/// Верхняя регуляризованная гамма‑функция *Q(a,x)*.
 double gammaQ(double a, double x) {
     if (x < 0 || a <= 0) return 0;
     if (x == 0) return 1;
@@ -117,11 +218,19 @@ double gammaQ(double a, double x) {
     return impl::gamma_cf(a, x) / std::tgamma(a);
 }
 
+/// Стандартная кумулятивная функция Φ нормального *N(0,1)*.
 inline double Phi(double x) { return 0.5 * (1 + std::erf(x / M_SQRT2)); }
 
-// ============================================================
-//  Реализация 5 базовых тестов NIST‑STS (p‑value)
-// ============================================================
+/**
+ * @defgroup nist_tests Базовые тесты NIST‑STS
+ * @{
+ */
+
+/**
+ * @brief Monobit‑тест частоты единиц.
+ * @param bits Массив нулей/единиц
+ * @return p‑значение (удвоенная хвостовая вероятность нормального Z‑распределения)
+ */
 double p_monobit(const std::vector<int>& bits) {
     long S = 0; 
     for (int b : bits) S += b ? 1 : -1;
@@ -129,6 +238,11 @@ double p_monobit(const std::vector<int>& bits) {
     return std::erfc(sobs / M_SQRT2);
 }
 
+/**
+ * @brief Block Frequency Test (частота единиц в блоках длиной *M*).
+ * @param bits Поток битов
+ * @param M    Размер блока (по умолчанию 128)
+ */
 double p_blockfreq(const std::vector<int>& bits, int M = 128) {
     int n = bits.size(); 
     int N = n / M; 
@@ -142,6 +256,9 @@ double p_blockfreq(const std::vector<int>& bits, int M = 128) {
     return gammaQ(N / 2.0, 4 * M * chi / 2.0);
 }
 
+/**
+ * @brief Runs‑тест (чередования 0/1).
+ */
 double p_runs(const std::vector<int>& bits) {
     int n = bits.size(), ones = 0; 
     for (int b : bits) ones += b;
@@ -154,6 +271,9 @@ double p_runs(const std::vector<int>& bits) {
     return std::erfc(z);
 }
 
+/**
+ * @brief Longest Run of Ones in a Block.
+ */
 double p_longest_run(const std::vector<int>& bits) {
     int n = bits.size(); 
     if (n < 128) return 0;
@@ -215,6 +335,9 @@ double p_longest_run(const std::vector<int>& bits) {
     return gammaQ(K / 2.0, chi / 2.0);
 }
 
+/**
+ * @brief Cumulative Sums (Cusum) вверх.
+ */
 double p_cusum(const std::vector<int>& bits) {
     int n = bits.size();
     long S = 0, maxAbs = 0;
@@ -226,11 +349,14 @@ double p_cusum(const std::vector<int>& bits) {
         p += Phi((4 * k + 3) * z) - Phi((4 * k + 1) * z);
     return p;
 }
+/** @} */ // end of nist_tests
 
-// ============================================================
-//  χ²‑тест равномерности (10 корзин, df = 9)
-// ============================================================
-
+/**
+ * @brief Χ²‑статистика на 10 равных корзин по правилу Стерджеса.
+ * @param v Вектор 32‑битных слов
+ * @return Значение χ² (df = 9). Для получения p‑value используйте
+ *         gammaQ(9/2, χ²/2).
+ */
 double chi_square(const std::vector<u32>& v) {
     const int BINS = 10;           // число корзин по правилу Стерджеса
     std::size_t n = v.size();
@@ -252,10 +378,13 @@ double chi_square(const std::vector<u32>& v) {
     return chi; // df = 9
 }
 
-// ------------------------------------------------------------
-//  Тестирование одного генератора (20 выборок × 1000)
-// ------------------------------------------------------------
-
+/**
+ * @brief Запускает 20 выборок × 1000 значений, печатает краткую статистику
+ *        и p‑значения пяти NIST‑тестов + χ² равномерности.
+ * @tparam Gen Тип генератора, реализующий `u32 next()`.
+ * @param tag  Короткая метка, выводимая в таблицу.
+ * @param rng  Экземпляр генератора (передавать по ссылке).
+ */
 template <typename Gen>
 void test_generator(const std::string& tag, Gen& rng) {
     constexpr int SAMPLES = 20, SIZE = 1000;
@@ -310,10 +439,9 @@ void test_generator(const std::string& tag, Gen& rng) {
     }
 }
 
-// ============================================================
-//  Измерение времени генерации N чисел
-// ============================================================
-
+/**
+ * @brief Замеряет суммарное время (нс) на выдачу *N* чисел.
+ */
 template<typename Gen>
 long long bench(Gen& rng, int N){
     auto t0 = clk::now();
@@ -322,6 +450,10 @@ long long bench(Gen& rng, int N){
     return std::chrono::duration_cast<std::chrono::nanoseconds>(t1-t0).count();
 }
 
+/**
+ * @brief Создаёт CSV с таймингами для разных размеров буфера.
+ *        Колонки: N, LCG, XSW, Salted, mt19937 (в наносекундах).
+ */
 void benchmark_speed(){
     const std::vector<int> sizes = {1'000, 25'000, 50'000, 100'000, 200'000, 350'000, 500'000, 750'000, 1'000'000};
     std::ofstream csv("rng_speed.csv");
@@ -339,10 +471,11 @@ void benchmark_speed(){
     std::cout << "Тайминги сохранены в rng_speed.csv (наносекунд).\n";
 }
 
-// ============================================================
-//                      main()
-// ============================================================
-
+/**
+ * @brief Точка входа: тестирует три собственных ГПСЧ, печатает отчёт и
+ *        создаёт файл `rng_speed.csv`.
+ * @return 0 при успешном завершении.
+ */
 int main() {
     LcgPerm32  g1(123456ULL);
     Xsw32      g2(123456ULL);
