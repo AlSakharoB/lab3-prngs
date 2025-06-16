@@ -175,47 +175,11 @@ struct Mt32 {
     u32 next() { return e(); }     // теперь интерфейс такой же, как у других ГПСЧ
 };
 
-/**
- * Пространство имён с реализациями частичной суммы и непродолженной дроби
- * для верхней регуляризованной гамма‑функции *Q(a,x)*.
- */
-namespace impl {
-    /// Схема разложения в ряд (лучше при *x < a+1*).
-    double gamma_series(double a, double x) {
-        const int ITMAX = 1000; const double EPS = 1e-9;
-        double sum = 1.0 / a, term = sum;
-        for (int n = 1; n <= ITMAX; ++n) {
-            term *= x / (a + n);
-            sum += term;
-            if (fabs(term) < fabs(sum) * EPS) break;
-        }
-        return sum * std::exp(-x + a * std::log(x));
-    }
-
-    /// Вычисление дробью (лучше при *x ≥ a+1*).
-    double gamma_cf(double a, double x) {
-        const int ITMAX = 1000; const double EPS = 1e-9; const double FPMIN = 1e-30;
-        double b = x + 1 - a, c = 1 / FPMIN, d = 1 / b, f = d;
-        for (int i = 1; i <= ITMAX; ++i) {
-            double an = -i * (i - a);
-            b += 2; d = an * d + b; if (fabs(d) < FPMIN) d = FPMIN;
-            c = b + an / c;        if (fabs(c) < FPMIN) c = FPMIN;
-            d = 1 / d; double delta = d * c; f *= delta;
-            if (fabs(delta - 1) < EPS) break;
-        }
-        return std::exp(-x + a * std::log(x)) * f;
-    }
-}
-
 /// Верхняя регуляризованная гамма‑функция *Q(a,x)*.
 double gammaQ(double a, double x) {
-    if (x < 0 || a <= 0) return 0;
-    if (x == 0) return 1;
-    if (x < a + 1) {
-        double P = impl::gamma_series(a, x) / std::tgamma(a);
-        return 1 - P;
-    }
-    return impl::gamma_cf(a, x) / std::tgamma(a);
+    double k = sqrt(2.0 * a - 1.0);
+    double z = (3.0 * k * (pow(x / a, 1.0/3.0) - 1.0 + 1.0/(9.0 * k * k)));
+    return 0.5 * erfc(z / M_SQRT2);
 }
 
 /// Стандартная кумулятивная функция Φ нормального *N(0,1)*.
@@ -244,8 +208,8 @@ double p_monobit(const std::vector<int>& bits) {
  * @param M    Размер блока (по умолчанию 128)
  */
 double p_blockfreq(const std::vector<int>& bits, int M = 128) {
-    int n = bits.size(); 
-    int N = n / M; 
+    unsigned long long n = bits.size(); 
+    unsigned long long N = n / M; 
     if (N == 0) return 0;
     double chi = 0;
     for (int i = 0; i < N; ++i) {
@@ -358,12 +322,11 @@ double p_cusum(const std::vector<int>& bits) {
  *         gammaQ(9/2, χ²/2).
  */
 double chi_square(const std::vector<u32>& v) {
-    const int BINS = 10;           // число корзин по правилу Стерджеса
     std::size_t n = v.size();
+    const int BINS = std::max(10, static_cast<int>(1 + std::log2(n)));              // число корзин по правилу Стерджеса
     double expected = static_cast<double>(n) / BINS;
-    std::uint64_t mask = 0xFFFFFFFFULL; // 32‑бит макс
 
-    std::array<int, BINS> freq{};
+    std::vector<int> freq(BINS, 0);
     for (u32 val : v) {
         // Быстрый способ: (val * BINS) >> 32 даёт 0..BINS‑1
         int idx = static_cast<int>((static_cast<u64>(val) * BINS) >> 32);
@@ -387,7 +350,7 @@ double chi_square(const std::vector<u32>& v) {
  */
 template <typename Gen>
 void test_generator(const std::string& tag, Gen& rng) {
-    constexpr int SAMPLES = 20, SIZE = 1000;
+    constexpr int SAMPLES = 20, SIZE = 2000;
     constexpr double CHI_LOW = 5.899, CHI_HIGH = 11.389; // p‑коридор 25–75 %
 
     std::cout << "\n=== " << tag << " ===\n";
